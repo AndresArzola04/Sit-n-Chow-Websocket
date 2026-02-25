@@ -1,0 +1,19 @@
+{
+  "name": "websockets",
+  "description": "MJPEG ingest + stream service for Cloud Run",
+  "version": "0.0.1",
+  "private": true,
+  "license": "Apache Version 2.0",
+  "author": "Google LLC",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"INFO: no unit tests\""
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.19.0"
+  }
+}
