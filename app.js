@@ -65,28 +65,29 @@ app.get('/stream.mjpeg', (req, res) => {
   });
 
   let closed = false;
-  req.on('close', () => {
-    closed = true;
-  });
+  let lastFrameId = -1;
 
-  const fps = 15;
-  const intervalMs = Math.floor(1000 / fps);
+  req.on('close', () => { closed = true; });
+
+  const intervalMs = Math.floor(1000 / 15);
+
+  // Pre-build the static parts once
+  const BOUNDARY = '--frame\r\n';
+  const CONTENT_TYPE = 'Content-Type: image/jpeg\r\n';
+  const CRLF = '\r\n';
 
   const timer = setInterval(() => {
-    if (closed) {
-      clearInterval(timer);
-      return;
-    }
+    if (closed) { clearInterval(timer); return; }
 
-    const { latestJpeg, latestTs } = streamStore.getLatestFrame();
-    if (!latestJpeg) return;
+    const { latestJpeg, latestTs, frameId } = streamStore.getLatestFrame();
+    if (!latestJpeg || frameId === lastFrameId) return; // skip if no new frame
 
-    res.write(`--frame\r\n`);
-    res.write(`Content-Type: image/jpeg\r\n`);
-    res.write(`Content-Length: ${latestJpeg.length}\r\n`);
-    res.write(`X-Timestamp: ${latestTs}\r\n\r\n`);
+    lastFrameId = frameId;
+    res.write(BOUNDARY);
+    res.write(CONTENT_TYPE);
+    res.write(`Content-Length: ${latestJpeg.length}\r\nX-Timestamp: ${latestTs}\r\n\r\n`);
     res.write(latestJpeg);
-    res.write('\r\n');
+    res.write(CRLF);
   }, intervalMs);
 });
 
