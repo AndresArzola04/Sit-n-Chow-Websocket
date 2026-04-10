@@ -196,9 +196,29 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ingest' });
 
 wss.on('connection', (ws) => {
+  ws.deviceId = null;
+
   ws.on('message', (data, isBinary) => {
-    if (!isBinary) return;
-    streamStore.setLatestFrame(Buffer.from(data));
+    if (!isBinary) {
+      try {
+        const msg = JSON.parse(data.toString());
+
+        if (msg.type === 'hello' && typeof msg.deviceId === 'string' && msg.deviceId.length > 0) {
+          ws.deviceId = msg.deviceId;
+          console.log(`WS registered deviceId=${ws.deviceId}`);
+        }
+      } catch (err) {
+        console.warn('Invalid WS text message:', err.message);
+      }
+      return;
+    }
+
+    if (!ws.deviceId) {
+      console.warn('Dropping frame because deviceId was not set first');
+      return;
+    }
+
+    streamStore.setLatestFrame(ws.deviceId, Buffer.from(data));
   });
 
   ws.isAlive = true;

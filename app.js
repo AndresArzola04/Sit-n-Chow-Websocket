@@ -24,8 +24,14 @@ app.get('/', (_req, res) => {
 });
 
 // Serves the latest JPEG frame as a raw image (for Flutter app polling)
-app.get('/view', (_req, res) => {
-  const { latestJpeg, latestTs } = streamStore.getLatestFrame();
+app.get('/view', (req, res) => {
+  const deviceId = req.query.device;
+
+  if (!deviceId) {
+    return res.status(400).send('Missing device query param');
+  }
+
+  const { latestJpeg, latestTs } = streamStore.getLatestFrame(deviceId);
 
   if (!latestJpeg) {
     return res.status(503).send('No frame available yet');
@@ -42,20 +48,28 @@ app.get('/view', (_req, res) => {
 });
 
 // Browser debug viewer
-app.get('/debug', (_req, res) => {
+app.get('/debug', (req, res) => {
+  const deviceId = req.query.device || '';
+
   res
     .status(200)
     .send(`<!doctype html>
 <html>
   <head><meta charset="utf-8"><title>MJPEG Viewer</title></head>
   <body style="margin:0; background:#111; display:flex; align-items:center; justify-content:center; height:100vh;">
-    <img src="/stream.mjpeg" style="max-width:100%; max-height:100%;" />
+    <img src="/stream.mjpeg?device=${encodeURIComponent(deviceId)}" style="max-width:100%; max-height:100%;" />
   </body>
 </html>`);
 });
 
 // MJPEG stream endpoint
 app.get('/stream.mjpeg', (req, res) => {
+  const deviceId = req.query.device;
+
+  if (!deviceId) {
+    return res.status(400).send('Missing device query param');
+  }
+
   res.writeHead(200, {
     'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
     'Cache-Control': 'no-cache, no-store, must-revalidate',
@@ -71,16 +85,18 @@ app.get('/stream.mjpeg', (req, res) => {
 
   const intervalMs = Math.floor(1000 / 15);
 
-  // Pre-build the static parts once
   const BOUNDARY = '--frame\r\n';
   const CONTENT_TYPE = 'Content-Type: image/jpeg\r\n';
   const CRLF = '\r\n';
 
   const timer = setInterval(() => {
-    if (closed) { clearInterval(timer); return; }
+    if (closed) {
+      clearInterval(timer);
+      return;
+    }
 
-    const { latestJpeg, latestTs, frameId } = streamStore.getLatestFrame();
-    if (!latestJpeg || frameId === lastFrameId) return; // skip if no new frame
+    const { latestJpeg, latestTs, frameId } = streamStore.getLatestFrame(deviceId);
+    if (!latestJpeg || frameId === lastFrameId) return;
 
     lastFrameId = frameId;
     res.write(BOUNDARY);
