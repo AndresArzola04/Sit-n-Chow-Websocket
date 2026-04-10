@@ -1,15 +1,24 @@
-let latestJpeg = null;
-let latestTs = 0;
-let frameId = 0;
+const frames = new Map();
 
-function setLatestFrame(buf) {
-  latestJpeg = buf;
-  latestTs = Date.now();
-  frameId++;
+function setLatestFrame(deviceId, buf) {
+  if (!deviceId) return;
+
+  const existing = frames.get(deviceId);
+  const nextFrameId = existing ? existing.frameId + 1 : 1;
+
+  frames.set(deviceId, {
+    latestJpeg: buf,
+    latestTs: Date.now(),
+    frameId: nextFrameId,
+  });
 }
 
-function getLatestFrame() {
-  return { latestJpeg, latestTs, frameId };
+function getLatestFrame(deviceId) {
+  if (!deviceId) {
+    return { latestJpeg: null, latestTs: 0, frameId: 0 };
+  }
+
+  return frames.get(deviceId) || { latestJpeg: null, latestTs: 0, frameId: 0 };
 }
 
 module.exports = { setLatestFrame, getLatestFrame };
