@@ -1,6 +1,8 @@
 /* eslint-disable no-process-exit */
 
 const http    = require('http');
+const fs      = require('fs');
+const path    = require('path');
 const { WebSocketServer } = require('ws');
 
 const pkg         = require('./package');
@@ -41,11 +43,6 @@ initFirebaseAdmin();
 
 const TARGET_RATE = 16000;
 
-/*
- * Swap every pair of bytes in-place.
- * Used to convert big-endian int16 (CAFF/iOS default) → little-endian
- * which is what the ESP audio player expects.
- */
 function swapBytes(buf) {
   const out = Buffer.allocUnsafe(buf.length);
   for (let i = 0; i + 1 < buf.length; i += 2) {
@@ -55,10 +52,6 @@ function swapBytes(buf) {
   return out;
 }
 
-/*
- * Linear interpolation resampler: srcRate → TARGET_RATE (16000 Hz).
- * Input must be little-endian int16 PCM.
- */
 function resamplePCM(inputBuf, srcRate) {
   if (srcRate === TARGET_RATE) return inputBuf;
 
@@ -80,6 +73,70 @@ function resamplePCM(inputBuf, srcRate) {
   }
 
   return outputBuf;
+}
+
+/* AGC state — adapts gain to mic level automatically */
+let agcGain = 15;
+
+function processAudio(buf) {
+  const AGC_TARGET_RMS = 10000; /* target output RMS — loud enough for speaker */
+  const MAX_GAIN       = 50;
+  const MIN_GAIN       = 2;
+  const SILENCE_RMS    = 80;    /* true silence gate */
+  const samples = buf.length / 2;
+
+  let sumSq = 0;
+  for (let i = 0; i < samples; i++) {
+    const s = buf.readInt16LE(i * 2);
+    sumSq += s * s;
+  }
+  const rms = Math.sqrt(sumSq / samples);
+
+  if (rms < SILENCE_RMS) return Buffer.alloc(buf.length, 0);
+
+  /* Exponential smoothing — avoids pumping on transients */
+  const idealGain = AGC_TARGET_RMS / rms;
+  const clamped   = Math.max(MIN_GAIN, Math.min(MAX_GAIN, idealGain));
+  agcGain = agcGain * 0.85 + clamped * 0.15;
+
+  const out = Buffer.allocUnsafe(buf.length);
+  for (let i = 0; i < samples; i++) {
+    const s = buf.readInt16LE(i * 2);
+    const amplified = Math.max(-32768, Math.min(32767, Math.round(s * agcGain)));
+    out.writeInt16LE(amplified, i * 2);
+  }
+  return out;
+}
+
+/* ── WAV capture for debug-audio endpoint ───────────────────────────────── */
+
+let debugChunks    = [];
+let debugCapturing = false;
+
+function writeWav(pcmBuf, sampleRate, outputPath) {
+  const numChannels  = 1;
+  const bitsPerSample = 16;
+  const byteRate     = sampleRate * numChannels * bitsPerSample / 8;
+  const blockAlign   = numChannels * bitsPerSample / 8;
+  const dataSize     = pcmBuf.length;
+  const header       = Buffer.allocUnsafe(44);
+
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + dataSize, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);            // PCM
+  header.writeUInt16LE(numChannels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(dataSize, 40);
+
+  fs.writeFileSync(outputPath, Buffer.concat([header, pcmBuf]));
+  console.log(`Debug WAV saved: ${pcmBuf.length} bytes → ${outputPath}`);
 }
 
 /* ── ESP32 token endpoint ────────────────────────────────────────────────── */
@@ -180,16 +237,7 @@ wssCamera.on('connection', (ws) => {
   ws.on('close', () => console.log('Camera ingest disconnected'));
 });
 
-/* ── /audio-ingest — Flutter mic → server ────────────────────────────────── *
- *
- * Protocol:
- *   1. Connect
- *   2. Text: "sampleRate:<N>"          e.g. "sampleRate:44100"
- *   3. Text: "bigEndian:true|false"    whether PCM bytes are big-endian
- *                                      (iOS CAFF = true, Android raw = false)
- *   4. Binary frames: raw int16 PCM (no container, no header)
- *   5. Text: "stop"
- * ─────────────────────────────────────────────────────────────────────────── */
+/* ── /audio-ingest — Flutter mic → server ────────────────────────────────── */
 
 const wssAudioIngest = new WebSocketServer({ noServer: true });
 
@@ -197,8 +245,12 @@ wssAudioIngest.on('connection', (ws) => {
   console.log('Audio ingest connected (Flutter mic active)');
   audioStore.clearChunks();
 
+  // Reset debug capture for this session
+  debugChunks    = [];
+  debugCapturing = true;
+
   let srcRate   = null;
-  let bigEndian = false;  // default: little-endian (Android)
+  let bigEndian = false;
 
   ws.on('message', (data, isBinary) => {
     if (!isBinary) {
@@ -225,6 +277,18 @@ wssAudioIngest.on('connection', (ws) => {
         wssAudioStream.clients.forEach((client) => {
           if (client.readyState === client.OPEN) client.send('stop', { binary: false });
         });
+
+        // Save the captured session as a WAV for inspection
+        if (debugCapturing && debugChunks.length > 0) {
+          try {
+            const combined = Buffer.concat(debugChunks);
+            writeWav(combined, TARGET_RATE, path.join('/tmp', 'debug_audio.wav'));
+          } catch (e) {
+            console.error('Failed to write debug WAV:', e.message);
+          }
+          debugChunks    = [];
+          debugCapturing = false;
+        }
         return;
       }
 
@@ -239,17 +303,21 @@ wssAudioIngest.on('connection', (ws) => {
 
     let rawBuf = Buffer.from(data);
 
-    // iOS CAFF stores PCM as big-endian — swap to little-endian for the ESP
-    if (bigEndian) {
-      rawBuf = swapBytes(rawBuf);
-    }
+    if (bigEndian) rawBuf = swapBytes(rawBuf);
 
     const first4 = Array.from(rawBuf.slice(0, 4))
       .map(b => '0x' + b.toString(16).padStart(2, '0'));
     console.log(`Audio chunk: ${rawBuf.length} bytes @ ${srcRate} Hz | first bytes: ${first4.join(' ')}`);
 
-    const outBuf = resamplePCM(rawBuf, srcRate);
+    const outBuf = processAudio(resamplePCM(rawBuf, srcRate));
     console.log(`  → resampled to ${outBuf.length} bytes @ ${TARGET_RATE} Hz`);
+
+    const normFirst4 = Array.from(outBuf.slice(0, 4)).map(b => '0x' + b.toString(16).padStart(2, '0'));
+    console.log(`  → normalized first bytes: ${normFirst4.join(' ')}`);
+
+    // Accumulate for debug WAV — capture raw (pre-processAudio) so we can
+    // hear what the mic actually captured without gain/gate affecting it
+    if (debugCapturing) debugChunks.push(Buffer.from(rawBuf));
 
     audioStore.setLatestChunk(outBuf);
     wssAudioStream.clients.forEach((client) => {
@@ -263,6 +331,18 @@ wssAudioIngest.on('connection', (ws) => {
     wssAudioStream.clients.forEach((client) => {
       if (client.readyState === client.OPEN) client.send('stop', { binary: false });
     });
+
+    // Save WAV on disconnect too (in case stop message wasn't sent)
+    if (debugCapturing && debugChunks.length > 0) {
+      try {
+        const combined = Buffer.concat(debugChunks);
+        writeWav(combined, TARGET_RATE, path.join('/tmp', 'debug_audio.wav'));
+      } catch (e) {
+        console.error('Failed to write debug WAV:', e.message);
+      }
+      debugChunks    = [];
+      debugCapturing = false;
+    }
   });
 
   ws.on('error', (err) => console.error('Audio ingest WS error:', err));
@@ -273,8 +353,6 @@ wssAudioIngest.on('connection', (ws) => {
 const wssAudioStream = new WebSocketServer({ noServer: true });
 wssAudioStream.on('connection', (ws) => {
   console.log('ESP32 audio stream connected');
-  const { latestChunk } = audioStore.getLatestChunk();
-  if (latestChunk) ws.send(latestChunk, { binary: true });
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
   ws.on('error', (err) => console.error('Audio stream WS error:', err));

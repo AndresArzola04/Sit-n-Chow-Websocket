@@ -1,5 +1,6 @@
 const express = require('express');
-const path = require('path');
+const fs      = require('fs');
+const path    = require('path');
 
 const streamStore = require('./streamStore');
 
@@ -90,5 +91,25 @@ app.get('/stream.mjpeg', (req, res) => {
     res.write(CRLF);
   }, intervalMs);
 });
+
+// ── Audio debug capture ────────────────────────────────────────────────────
+//
+// After making a call, visit /debug-audio to download the WAV that was
+// sent to the ESP32. Open it in any audio player to hear exactly what
+// the ESP32 received — isolates whether the issue is before or after
+// the server.
+
+app.get('/debug-audio', (_req, res) => {
+  const filePath = path.join('/tmp', 'debug_audio.wav');
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).send(
+      'No audio captured yet. Make a call first, then visit this URL after hanging up.'
+    );
+  }
+  res.setHeader('Content-Type', 'audio/wav');
+  res.setHeader('Content-Disposition', 'attachment; filename="debug_audio.wav"');
+  fs.createReadStream(filePath).pipe(res);
+});
+
 
 module.exports = app;
