@@ -78,32 +78,28 @@ function resamplePCM(inputBuf, srcRate) {
 /* AGC state — adapts gain to mic level automatically */
 let agcGain = 15;
 
+/* Fixed gain with soft limiting — boosts quiet mic signal without clipping.
+ * Tanh soft-clip keeps peaks smooth even if gain pushes past full scale. */
 function processAudio(buf) {
-  const AGC_TARGET_RMS = 10000; /* target output RMS — loud enough for speaker */
-  const MAX_GAIN       = 50;
-  const MIN_GAIN       = 2;
-  const SILENCE_RMS    = 80;    /* true silence gate */
-  const samples = buf.length / 2;
+  const GAIN         = 4.0;   // raise overall volume — tweak between 2.0–6.0
+  const SILENCE_RMS  = 80;    // gate: true silence passes through as zero
+  const samples      = buf.length / 2;
 
+  // Silence gate — avoids amplifying background hiss between words
   let sumSq = 0;
   for (let i = 0; i < samples; i++) {
     const s = buf.readInt16LE(i * 2);
     sumSq += s * s;
   }
-  const rms = Math.sqrt(sumSq / samples);
-
-  if (rms < SILENCE_RMS) return Buffer.alloc(buf.length, 0);
-
-  /* Exponential smoothing — avoids pumping on transients */
-  const idealGain = AGC_TARGET_RMS / rms;
-  const clamped   = Math.max(MIN_GAIN, Math.min(MAX_GAIN, idealGain));
-  agcGain = agcGain * 0.85 + clamped * 0.15;
+  if (Math.sqrt(sumSq / samples) < SILENCE_RMS) return Buffer.alloc(buf.length, 0);
 
   const out = Buffer.allocUnsafe(buf.length);
   for (let i = 0; i < samples; i++) {
-    const s = buf.readInt16LE(i * 2);
-    const amplified = Math.max(-32768, Math.min(32767, Math.round(s * agcGain)));
-    out.writeInt16LE(amplified, i * 2);
+    const s       = buf.readInt16LE(i * 2);
+    const boosted = s * GAIN;
+    // Tanh soft clip: smoothly saturates instead of hard-clamping
+    const clipped = Math.tanh(boosted / 32768) * 32767;
+    out.writeInt16LE(Math.round(clipped), i * 2);
   }
   return out;
 }
