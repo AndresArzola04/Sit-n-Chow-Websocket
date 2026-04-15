@@ -1,11 +1,10 @@
 const express = require('express');
-const path = require('path');
 
 const streamStore = require('./streamStore');
+const { getPublicSession, listSessions } = require('./sessionManager');
 
 const app = express();
 
-// CORS middleware - allows Flutter mobile/web to access all endpoints
 app.use((_req, res, next) => {
   res.set('Access-Control-Allow-Origin', '*');
   res.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -13,17 +12,14 @@ app.use((_req, res, next) => {
   next();
 });
 
-// Handle OPTIONS preflight
 app.options('*', (_req, res) => {
   res.sendStatus(204);
 });
 
-// Health check
 app.get('/', (_req, res) => {
   res.status(200).send('OK');
 });
 
-// Serves the latest JPEG frame as a raw image (for Flutter app polling)
 app.get('/view', (req, res) => {
   const deviceId = req.query.device;
 
@@ -41,19 +37,16 @@ app.get('/view', (req, res) => {
     'Content-Type': 'image/jpeg',
     'Content-Length': latestJpeg.length,
     'Cache-Control': 'no-cache, no-store, must-revalidate',
-    'Pragma': 'no-cache',
+    Pragma: 'no-cache',
     'X-Timestamp': latestTs,
   });
   res.end(latestJpeg);
 });
 
-// Browser debug viewer
 app.get('/debug', (req, res) => {
   const deviceId = req.query.device || '';
 
-  res
-    .status(200)
-    .send(`<!doctype html>
+  res.status(200).send(`<!doctype html>
 <html>
   <head><meta charset="utf-8"><title>MJPEG Viewer</title></head>
   <body style="margin:0; background:#111; display:flex; align-items:center; justify-content:center; height:100vh;">
@@ -62,7 +55,6 @@ app.get('/debug', (req, res) => {
 </html>`);
 });
 
-// MJPEG stream endpoint
 app.get('/stream.mjpeg', (req, res) => {
   const deviceId = req.query.device;
 
@@ -73,8 +65,8 @@ app.get('/stream.mjpeg', (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
     'Cache-Control': 'no-cache, no-store, must-revalidate',
-    'Pragma': 'no-cache',
-    'Connection': 'keep-alive',
+    Pragma: 'no-cache',
+    Connection: 'keep-alive',
     'Access-Control-Allow-Origin': '*',
   });
 
@@ -105,6 +97,20 @@ app.get('/stream.mjpeg', (req, res) => {
     res.write(latestJpeg);
     res.write(CRLF);
   }, intervalMs);
+});
+
+app.get('/session', (req, res) => {
+  const deviceId = req.query.device;
+  if (!deviceId) return res.status(400).json({ error: 'Missing device query param' });
+
+  const session = getPublicSession(deviceId);
+  if (!session) return res.status(404).json({ error: 'No active session for device' });
+
+  res.json(session);
+});
+
+app.get('/sessions', (_req, res) => {
+  res.json({ sessions: listSessions() });
 });
 
 module.exports = app;

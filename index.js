@@ -2,14 +2,17 @@
 
 const http = require('http');
 const { WebSocketServer } = require('ws');
+const admin = require('firebase-admin');
 
 const pkg = require('./package');
 const app = require('./app');
 const streamStore = require('./streamStore');
+const { initFirebase } = require('./firebaseActions');
+const { startSessionIfNeeded } = require('./sessionManager');
 
 const PORT = parseInt(process.env.PORT, 10) || 8080;
 
-console.log("USING LOCAL TEST INDEX.JS");
+bootstrapFirebase();
 
 process.on('uncaughtException', (err) => {
   console.error('UNCAUGHT EXCEPTION:', err);
@@ -32,9 +35,8 @@ wss.on('connection', (ws, req) => {
 
   ws.deviceId = null;
 
-  ws.on('message', (data, isBinary) => {
+  ws.on('message', async (data, isBinary) => {
     try {
-      // TEXT MESSAGE (device registration)
       if (!isBinary) {
         const txt = data.toString();
         console.log('WS text message:', txt);
@@ -54,19 +56,14 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
-      // BINARY FRAME
       if (!ws.deviceId) {
         console.warn('Dropping frame because deviceId was not set first');
         return;
       }
 
-      console.log(`Received frame for ${ws.deviceId}, bytes=${data.length}`);
-
       const jpegBuffer = Buffer.from(data);
-
       streamStore.setLatestFrame(ws.deviceId, jpegBuffer);
-
-      console.log(`Stored latest frame for ${ws.deviceId}`);
+      await startSessionIfNeeded(ws.deviceId);
     } catch (err) {
       console.error('WS message handler error:', err);
     }
@@ -94,5 +91,30 @@ process.on('SIGTERM', () => {
   } catch (e) {}
   server.close(() => process.exit(0));
 });
+
+function bootstrapFirebase() {
+  const dbUrl = process.env.FIREBASE_DB_URL;
+  const saJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+
+  if (!dbUrl || !saJson) {
+    console.warn('Firebase disabled: FIREBASE_DB_URL and FIREBASE_SERVICE_ACCOUNT_JSON not set');
+    return;
+  }
+
+  try {
+    const serviceAccount = JSON.parse(saJson);
+    if (!admin.apps.length) {
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+        databaseURL: dbUrl,
+      });
+    }
+
+    initFirebase(admin, admin.database());
+    console.log('Firebase initialized');
+  } catch (err) {
+    console.error('Failed to initialize Firebase:', err);
+  }
+}
 
 module.exports = server;
