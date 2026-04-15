@@ -196,6 +196,25 @@ function startNotificationForwarder() {
 
 startNotificationForwarder();
 
+/* ── Firebase test endpoint ───────────────────────────────────────────────
+ *
+ * Call GET /firebase-test to verify Firebase is working and the service account
+ * has write permissions. This writes a test value to debug/firebaseTest.
+ * ─────────────────────────────────────────────────────────────────────── */
+
+app.get('/firebase-test', async (req, res) => {
+  if (!db) {
+    return res.status(503).json({ error: 'Firebase not initialised' });
+  }
+
+  await db.ref('debug/firebaseTest').set({
+    ok: true,
+    ts: Date.now(),
+  });
+
+  return res.json({ ok: true });
+});
+
 /* ── ML session processing ─────────────────────────────────────────────── */
 
 async function processFrameForSession(deviceId, jpegBuffer) {
