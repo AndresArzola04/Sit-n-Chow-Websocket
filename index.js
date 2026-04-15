@@ -1,3 +1,4 @@
+require('dotenv').config();
 /* eslint-disable no-process-exit */
 
 const http = require('http');
