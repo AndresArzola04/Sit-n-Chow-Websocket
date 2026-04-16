@@ -1,109 +1,291 @@
 require('dotenv').config();
+
 /* eslint-disable no-process-exit */
 
 const http = require('http');
-const { WebSocketServer } = require('ws');
+const express = require('express');
 const admin = require('firebase-admin');
+const { WebSocketServer } = require('ws');
 
-const pkg = require('./package');
-const app = require('./app');
 const streamStore = require('./streamStore');
+const {
+  startSession,
+  stopSession,
+  getPublicSession,
+  listSessions,
+} = require('./sessionManager');
 const { initFirebase } = require('./firebaseActions');
-const { startSessionIfNeeded } = require('./sessionManager');
 
-const PORT = parseInt(process.env.PORT, 10) || 8080;
+const PORT = parseInt(process.env.PORT || '8080', 10);
 
 bootstrapFirebase();
 
-process.on('uncaughtException', (err) => {
-  console.error('UNCAUGHT EXCEPTION:', err);
+const app = express();
+app.use(express.json());
+
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok' });
 });
 
-process.on('unhandledRejection', (err) => {
-  console.error('UNHANDLED REJECTION:', err);
+app.get('/view', (req, res) => {
+  const deviceId = req.query.device;
+  if (!deviceId) {
+    return res.status(400).send('Missing device query parameter');
+  }
+
+  const { latestJpeg } = streamStore.getLatestFrame(deviceId);
+  if (!latestJpeg) {
+    return res.status(404).send('No frame available for device');
+  }
+
+  res.setHeader('Content-Type', 'image/jpeg');
+  res.setHeader('Cache-Control', 'no-store');
+  return res.end(latestJpeg);
+});
+
+app.get('/stream.mjpeg', (req, res) => {
+  const deviceId = req.query.device;
+  if (!deviceId) {
+    return res.status(400).send('Missing device query parameter');
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
+    'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+    Pragma: 'no-cache',
+    Expires: '0',
+    Connection: 'close',
+  });
+
+  let closed = false;
+
+  const interval = setInterval(() => {
+    if (closed) return;
+
+    const { latestJpeg } = streamStore.getLatestFrame(deviceId);
+    if (!latestJpeg) return;
+
+    res.write(`--frame\r\n`);
+    res.write(`Content-Type: image/jpeg\r\n`);
+    res.write(`Content-Length: ${latestJpeg.length}\r\n\r\n`);
+    res.write(latestJpeg);
+    res.write('\r\n');
+  }, 200);
+
+  req.on('close', () => {
+    closed = true;
+    clearInterval(interval);
+  });
+});
+
+app.get('/debug', (req, res) => {
+  const deviceId = req.query.device;
+  if (!deviceId) {
+    return res.status(400).send('Missing device query parameter');
+  }
+
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.end(`
+    <!doctype html>
+    <html>
+      <head>
+        <title>Debug Stream - ${escapeHtml(deviceId)}</title>
+        <style>
+          body {
+            font-family: Arial, sans-serif;
+            margin: 24px;
+          }
+          img {
+            max-width: 100%;
+            height: auto;
+            border: 1px solid #ccc;
+          }
+          code {
+            background: #f4f4f4;
+            padding: 2px 6px;
+          }
+          button {
+            margin-right: 8px;
+            margin-top: 8px;
+            padding: 8px 14px;
+            font-size: 14px;
+          }
+        </style>
+      </head>
+      <body>
+        <h1>Debug Stream</h1>
+        <p><strong>Device:</strong> <code>${escapeHtml(deviceId)}</code></p>
+        <p><strong>MJPEG:</strong> <code>/stream.mjpeg?device=${encodeURIComponent(deviceId)}</code></p>
+
+        <div>
+          <button onclick="startSession()">Start 3-minute ML session</button>
+          <button onclick="stopSession()">Stop session</button>
+        </div>
+
+        <p id="status"></p>
+
+        <img src="/stream.mjpeg?device=${encodeURIComponent(deviceId)}" alt="Live stream" />
+
+        <script>
+          async function startSession() {
+            const res = await fetch('/sessions/${encodeURIComponent(deviceId)}/start?success_seconds=5&timeout_seconds=180', {
+              method: 'POST'
+            });
+            document.getElementById('status').innerText = await res.text();
+          }
+
+          async function stopSession() {
+            const res = await fetch('/sessions/${encodeURIComponent(deviceId)}/stop', {
+              method: 'POST'
+            });
+            document.getElementById('status').innerText = await res.text();
+          }
+        </script>
+      </body>
+    </html>
+  `);
+});
+
+app.post('/sessions/:deviceId/start', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+
+    const successSeconds = parseOptionalNumber(
+      req.query.success_seconds ?? req.body?.success_seconds
+    );
+    const timeoutSeconds = parseOptionalNumber(
+      req.query.timeout_seconds ?? req.body?.timeout_seconds
+    );
+    const grams = parseOptionalInteger(
+      req.query.grams ?? req.body?.grams
+    );
+
+    const session = await startSession(deviceId, {
+      successSeconds,
+      timeoutSeconds,
+      grams,
+    });
+
+    return res.json({
+      ok: true,
+      message: 'Session started',
+      session,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: String(err?.message || err),
+    });
+  }
+});
+
+app.post('/sessions/:deviceId/stop', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    await stopSession(deviceId, {
+      type: 'session_stopped',
+      reason: 'manual_stop',
+    });
+
+    return res.json({
+      ok: true,
+      message: 'Session stopped',
+      deviceId,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: String(err?.message || err),
+    });
+  }
+});
+
+app.get('/session', (req, res) => {
+  const deviceId = req.query.device;
+  if (!deviceId) {
+    return res.status(400).json({ error: 'Missing device query parameter' });
+  }
+
+  const session = getPublicSession(deviceId);
+  if (!session) {
+    return res.status(404).json({ error: 'No session found for device', deviceId });
+  }
+
+  return res.json(session);
+});
+
+app.get('/sessions', (_req, res) => {
+  res.json(listSessions());
 });
 
 const server = http.createServer(app);
 
-server.on('error', (err) => {
-  console.error('HTTP SERVER ERROR:', err);
+const wss = new WebSocketServer({
+  server,
+  path: '/ingest',
 });
 
-const wss = new WebSocketServer({ server, path: '/ingest' });
-
-wss.on('connection', (ws, req) => {
-  console.log('WS connection opened from', req.socket.remoteAddress);
-
+wss.on('connection', (ws) => {
   ws.deviceId = null;
+  ws.autoSessionStarted = false;
 
   ws.on('message', async (data, isBinary) => {
     try {
       if (!isBinary) {
-        const txt = data.toString();
-        console.log('WS text message:', txt);
+        const text = data.toString('utf8');
 
-        const msg = JSON.parse(txt);
-
-        if (
-          msg.type === 'hello' &&
-          typeof msg.deviceId === 'string' &&
-          msg.deviceId.length > 0
-        ) {
-          ws.deviceId = msg.deviceId;
-          console.log(`WS registered deviceId=${ws.deviceId}`);
+        let msg;
+        try {
+          msg = JSON.parse(text);
+        } catch {
           return;
+        }
+
+        if (msg?.type === 'hello' && msg?.deviceId) {
+          ws.deviceId = msg.deviceId;
+          await startSessionOnce(ws);
         }
 
         return;
       }
 
       if (!ws.deviceId) {
-        console.warn('Dropping frame because deviceId was not set first');
         return;
       }
 
-      const jpegBuffer = Buffer.from(data);
-      streamStore.setLatestFrame(ws.deviceId, jpegBuffer);
-      await startSessionIfNeeded(ws.deviceId);
+      const frameBuffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      streamStore.setLatestFrame(ws.deviceId, frameBuffer);
+
+      await startSessionOnce(ws);
     } catch (err) {
-      console.error('WS message handler error:', err);
+      console.error('[ws] message handling error:', err);
     }
   });
 
   ws.on('error', (err) => {
-    console.error('WS error:', err);
-  });
-
-  ws.on('close', (code, reason) => {
-    console.log(
-      `WS closed for deviceId=${ws.deviceId}, code=${code}, reason=${reason.toString()}`
-    );
+    console.error('[ws] socket error', {
+      deviceId: ws.deviceId,
+      error: err.message,
+    });
   });
 });
 
 server.listen(PORT, () => {
-  console.log(`${pkg.name}: listening on port ${PORT}`);
-});
-
-process.on('SIGTERM', () => {
-  console.log(`${pkg.name}: received SIGTERM`);
-  try {
-    wss.close();
-  } catch (e) {}
-  server.close(() => process.exit(0));
+  console.log(`websockets: listening on port ${PORT}`);
 });
 
 function bootstrapFirebase() {
   const dbUrl = process.env.FIREBASE_DB_URL;
-  const saJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
 
-  if (!dbUrl || !saJson) {
-    console.warn('Firebase disabled: FIREBASE_DB_URL and FIREBASE_SERVICE_ACCOUNT_JSON not set');
+  if (!dbUrl || !rawJson) {
+    console.log('Firebase not configured; running without Firebase');
     return;
   }
 
   try {
-    const serviceAccount = JSON.parse(saJson);
+    const serviceAccount = JSON.parse(rawJson);
+
     if (!admin.apps.length) {
       admin.initializeApp({
         credential: admin.credential.cert(serviceAccount),
@@ -118,4 +300,44 @@ function bootstrapFirebase() {
   }
 }
 
-module.exports = server;
+async function startSessionOnce(ws) {
+  if (!ws?.deviceId) return;
+  if (ws.autoSessionStarted) return;
+
+  const existing = getPublicSession(ws.deviceId);
+  if (existing?.active) {
+    ws.autoSessionStarted = true;
+    return;
+  }
+
+  try {
+    await startSession(ws.deviceId, {
+      successSeconds: 5,
+      timeoutSeconds: 180,
+    });
+    ws.autoSessionStarted = true;
+  } catch (err) {
+    console.error('[session] auto-start failed:', err);
+  }
+}
+
+function parseOptionalNumber(value) {
+  if (value === undefined || value === null || value === '') return undefined;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function parseOptionalInteger(value) {
+  if (value === undefined || value === null || value === '') return undefined;
+  const n = parseInt(String(value), 10);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}

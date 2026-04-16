@@ -3,9 +3,9 @@ const { predictFrame } = require('./mlClient');
 const { writeDispenseCommand, writeFeedEvent, writeMlStatus } = require('./firebaseActions');
 
 const POLL_INTERVAL_MS = parseInt(process.env.ML_POLL_INTERVAL_MS || '250', 10);
-const SUCCESS_SECONDS = parseFloat(process.env.SIT_SUCCESS_SECONDS || '5');
-const TIMEOUT_SECONDS = parseFloat(process.env.SESSION_TIMEOUT_SECONDS || '180');
-const DISPENSE_GRAMS = parseInt(process.env.DISPENSE_GRAMS || '25', 10);
+const DEFAULT_SUCCESS_SECONDS = parseFloat(process.env.SIT_SUCCESS_SECONDS || '5');
+const DEFAULT_TIMEOUT_SECONDS = parseFloat(process.env.SESSION_TIMEOUT_SECONDS || '180');
+const DEFAULT_DISPENSE_GRAMS = parseInt(process.env.DISPENSE_GRAMS || '25', 10);
 
 const sessions = new Map();
 
@@ -16,6 +16,7 @@ function getSession(deviceId) {
 function getPublicSession(deviceId) {
   const s = sessions.get(deviceId);
   if (!s) return null;
+
   return {
     deviceId,
     active: s.active,
@@ -27,6 +28,7 @@ function getPublicSession(deviceId) {
     finalEvent: s.finalEvent,
     timeoutSeconds: s.timeoutSeconds,
     successSeconds: s.successSeconds,
+    grams: s.grams,
   };
 }
 
@@ -34,8 +36,43 @@ function listSessions() {
   return Array.from(sessions.keys()).map((deviceId) => getPublicSession(deviceId));
 }
 
-async function startSessionIfNeeded(deviceId) {
-  if (!deviceId || sessions.has(deviceId)) return;
+function prettyPrintInference(deviceId, payload) {
+  console.log('\n=== ML INFERENCE ===');
+  console.log(
+    JSON.stringify(
+      {
+        deviceId,
+        ...payload,
+      },
+      null,
+      2
+    )
+  );
+}
+
+function prettyPrintFinal(deviceId, finalPayload) {
+  console.log('\n=== SESSION FINAL ===');
+  console.log(
+    JSON.stringify(
+      {
+        deviceId,
+        ...finalPayload,
+      },
+      null,
+      2
+    )
+  );
+}
+
+async function startSession(deviceId, options = {}) {
+  if (!deviceId) {
+    throw new Error('deviceId is required');
+  }
+
+  const existing = sessions.get(deviceId);
+  if (existing?.active) {
+    return getPublicSession(deviceId);
+  }
 
   const session = {
     deviceId,
@@ -47,9 +84,17 @@ async function startSessionIfNeeded(deviceId) {
     running: false,
     finalEvent: null,
     lastResult: null,
-    timeoutSeconds: TIMEOUT_SECONDS,
-    successSeconds: SUCCESS_SECONDS,
-    grams: DISPENSE_GRAMS,
+    sitConfidenceSum: 0,
+    sitConfidenceCount: 0,
+    timeoutSeconds: Number.isFinite(options.timeoutSeconds)
+      ? options.timeoutSeconds
+      : DEFAULT_TIMEOUT_SECONDS,
+    successSeconds: Number.isFinite(options.successSeconds)
+      ? options.successSeconds
+      : DEFAULT_SUCCESS_SECONDS,
+    grams: Number.isFinite(options.grams)
+      ? options.grams
+      : DEFAULT_DISPENSE_GRAMS,
   };
 
   sessions.set(deviceId, session);
@@ -59,10 +104,13 @@ async function startSessionIfNeeded(deviceId) {
     type: 'session_started',
     source: 'websocket-backend',
   });
+
   await writeMlStatus(deviceId, {
     status: 'running',
     event: { type: 'session_started' },
     session_started_at: session.startedAt,
+    timeout_seconds: session.timeoutSeconds,
+    success_seconds: session.successSeconds,
     updatedAt: Date.now(),
   });
 
@@ -73,6 +121,13 @@ async function startSessionIfNeeded(deviceId) {
       error: String(err?.message || err),
     }).catch((inner) => console.error('finishSession error:', inner));
   });
+
+  return getPublicSession(deviceId);
+}
+
+async function stopSession(deviceId, event = { type: 'session_stopped' }) {
+  await finishSession(deviceId, event);
+  return getPublicSession(deviceId);
 }
 
 async function runLoop(deviceId) {
@@ -100,31 +155,57 @@ async function runLoop(deviceId) {
       }
 
       session.lastFrameId = frameId;
+
+      console.log(`[session] calling ML for ${deviceId}, frameId=${frameId}`);
       const ml = await predictFrame(latestJpeg);
+
       if (!ml) {
         await sleep(POLL_INTERVAL_MS);
         continue;
       }
+
       session.lastInferenceAt = Date.now();
 
       const posture = ml.posture || 'unknown';
       const dogDetected = !!ml.dog_detected;
 
+      const sitScore =
+        typeof ml.sit_probability === 'number'
+          ? ml.sit_probability
+          : (typeof ml.confidence === 'number' ? ml.confidence : null);
+
       if (dogDetected && posture === 'sitting') {
-        if (!session.sitStartedAt) session.sitStartedAt = session.lastInferenceAt;
+        if (!session.sitStartedAt) {
+          session.sitStartedAt = session.lastInferenceAt;
+          session.sitConfidenceSum = 0;
+          session.sitConfidenceCount = 0;
+        }
+
+        if (sitScore !== null) {
+          session.sitConfidenceSum += sitScore;
+          session.sitConfidenceCount += 1;
+        }
       } else {
         session.sitStartedAt = null;
+        session.sitConfidenceSum = 0;
+        session.sitConfidenceCount = 0;
       }
 
       const sitDurationSec = session.sitStartedAt
         ? (session.lastInferenceAt - session.sitStartedAt) / 1000
         : 0;
 
+      const avgSitConfidence =
+        session.sitConfidenceCount > 0
+          ? session.sitConfidenceSum / session.sitConfidenceCount
+          : null;
+
       const payload = {
         ...ml,
         dog_detected: dogDetected,
         posture,
         sit_duration_sec: sitDurationSec,
+        avg_sit_confidence: avgSitConfidence,
         session_duration_sec: elapsedSec,
         frame_id: frameId,
         updatedAt: session.lastInferenceAt,
@@ -137,6 +218,8 @@ async function runLoop(deviceId) {
       }
 
       session.lastResult = payload;
+
+      prettyPrintInference(deviceId, payload);
       await writeMlStatus(deviceId, payload);
 
       if (payload.event?.type === 'sit_success') {
@@ -146,16 +229,21 @@ async function runLoop(deviceId) {
           sit_duration_sec: sitDurationSec,
           sit_probability: payload.sit_probability,
           confidence: payload.confidence,
+          avg_sit_confidence: avgSitConfidence,
         });
         break;
       }
     } catch (err) {
       console.error(`[session] inference error for ${deviceId}:`, err);
-      await writeMlStatus(deviceId, {
+
+      const errorPayload = {
         status: 'error',
         event: { type: 'inference_error', message: String(err?.message || err) },
         updatedAt: Date.now(),
-      });
+      };
+
+      prettyPrintInference(deviceId, errorPayload);
+      await writeMlStatus(deviceId, errorPayload);
       await sleep(POLL_INTERVAL_MS);
     }
 
@@ -179,6 +267,8 @@ async function finishSession(deviceId, event) {
     updatedAt: Date.now(),
   };
 
+  prettyPrintFinal(deviceId, finalPayload);
+
   await writeMlStatus(deviceId, finalPayload);
   await writeFeedEvent(deviceId, {
     ...event,
@@ -186,6 +276,7 @@ async function finishSession(deviceId, event) {
   });
 
   if (event.type === 'sit_success') {
+    console.log('[session] SUCCESS average sit confidence:', event.avg_sit_confidence);
     await writeDispenseCommand(deviceId, session.grams);
   }
 
@@ -197,7 +288,8 @@ function sleep(ms) {
 }
 
 module.exports = {
-  startSessionIfNeeded,
+  startSession,
+  stopSession,
   getSession,
   getPublicSession,
   listSessions,

@@ -1,7 +1,8 @@
 const frames = new Map();
 
 function setLatestFrame(deviceId, buf) {
-  if (!deviceId) return;
+  if (!deviceId) 
+    return 0;
 
   const existing = frames.get(deviceId);
   const nextFrameId = existing ? existing.frameId + 1 : 1;
@@ -11,6 +12,8 @@ function setLatestFrame(deviceId, buf) {
     latestTs: Date.now(),
     frameId: nextFrameId,
   });
+
+  return nextFrameId;
 }
 
 function getLatestFrame(deviceId) {
