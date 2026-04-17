@@ -1,11 +1,10 @@
 const streamStore = require('./streamStore');
 const { predictFrame } = require('./mlClient');
-const { writeDispenseCommand, writeFeedEvent, writeMlStatus } = require('./firebaseActions');
+const { writeFeedEvent, writeMlStatus } = require('./firebaseActions');
 
 const POLL_INTERVAL_MS = parseInt(process.env.ML_POLL_INTERVAL_MS || '250', 10);
 const DEFAULT_SUCCESS_SECONDS = parseFloat(process.env.SIT_SUCCESS_SECONDS || '5');
 const DEFAULT_TIMEOUT_SECONDS = parseFloat(process.env.SESSION_TIMEOUT_SECONDS || '180');
-const DEFAULT_DISPENSE_GRAMS = parseInt(process.env.DISPENSE_GRAMS || '25', 10);
 
 const sessions = new Map();
 
@@ -92,9 +91,6 @@ async function startSession(deviceId, options = {}) {
     successSeconds: Number.isFinite(options.successSeconds)
       ? options.successSeconds
       : DEFAULT_SUCCESS_SECONDS,
-    grams: Number.isFinite(options.grams)
-      ? options.grams
-      : DEFAULT_DISPENSE_GRAMS,
   };
 
   sessions.set(deviceId, session);
@@ -277,7 +273,6 @@ async function finishSession(deviceId, event) {
 
   if (event.type === 'sit_success') {
     console.log('[session] SUCCESS average sit confidence:', event.avg_sit_confidence);
-    await writeDispenseCommand(deviceId, session.grams);
   }
 
   console.log(`[session] finished ${deviceId}: ${event.type}`);

@@ -6,19 +6,6 @@ function initFirebase(firebaseAdmin, database) {
   db = database;
 }
 
-async function writeDispenseCommand(deviceId, grams = 25) {
-  if (!db) return;
-
-  await db.ref(`commands/${deviceId}/pending`).set({
-    id: `ml-${deviceId}-${Date.now()}`,
-    action: 'dispense',
-    grams,
-    by: 'websocket-backend',
-    ts: Date.now(),
-    source: 'websocket-service',
-  });
-}
-
 async function writeFeedEvent(deviceId, event) {
   if (!db) return;
 
