@@ -1,437 +1,299 @@
-/* eslint-disable no-process-exit */
+const express = require('express');
+const { Readable } = require('stream');
+const fetch = require('node-fetch');
 
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
-const admin = require('firebase-admin');
-const { WebSocketServer } = require('ws');
-
-const app = require('./app');
-const streamStore = require('./streamStore');
-const audioStore = require('./audioStore');
 const {
+  initFirebase,
+  writeFeedEvent,
+  writeDeviceMlResult,
+} = require('./firebaseActions');
+const { createApp } = require('./app');
+const { attachDebugAudioRoute, setAudioChunk } = require('./audioStore');
+const {
+  ingestFrame,
+  getLatestFrameBuffer,
+  attachViewer,
+  clearDevice,
+} = require('./streamStore');
+const {
+  ensureSession,
   startSession,
   stopSession,
-  getPublicSession,
+  getSessionState,
+  getAllSessionsState,
+  setSessionMlResult,
+  attachSessionManager,
 } = require('./sessionManager');
-const { initFirebase } = require('./firebaseActions');
 
-const PORT = parseInt(process.env.PORT || '8080', 10);
-const TARGET_RATE = 16000;
+const app = express();
+app.use(express.json({ limit: '2mb' }));
 
-let debugChunks = [];
-let debugCapturing = false;
+const firebase = initFirebase();
+const admin = firebase?.admin || null;
+const db = firebase?.db || null;
 
-bootstrapFirebase();
-
-app.use(require('express').json());
-
-app.get('/esp-token', async (req, res) => {
-  try {
-    const deviceId = String(req.query.device || '').trim();
-    if (!deviceId) {
-      return res.status(400).json({ ok: false, error: 'Missing device query param' });
-    }
-
-    const expectedSecret = process.env.ESP_DEVICE_SECRET || '';
-    if (expectedSecret) {
-      const providedSecret = req.get('X-Device-Secret') || '';
-      if (providedSecret !== expectedSecret) {
-        return res.status(403).json({ ok: false, error: 'Forbidden' });
+attachSessionManager({
+  onFinal: async ({ deviceId, finalEvent, lastResult }) => {
+    console.log(`[session] final for ${deviceId}:`, finalEvent);
+    if (db) {
+      try {
+        await writeFeedEvent(db, deviceId, finalEvent);
+      } catch (err) {
+        console.error('[firebase] writeFeedEvent failed:', err.message);
+      }
+      try {
+        await writeDeviceMlResult(db, deviceId, lastResult, finalEvent);
+      } catch (err) {
+        console.error('[firebase] writeDeviceMlResult failed:', err.message);
       }
     }
+  },
+});
 
-    if (!admin.apps.length) {
-      return res.status(503).json({ ok: false, error: 'Firebase is not configured' });
-    }
+app.get('/health', (_req, res) => {
+  res.json({
+    ok: true,
+    firebase: !!db,
+    mlServiceUrl: process.env.ML_SERVICE_URL || null,
+  });
+});
 
-    const token = await admin.auth().createCustomToken(deviceId, {
+app.get('/esp-token', async (req, res) => {
+  if (!admin || !db) {
+    return res.status(503).json({ error: 'Firebase not initialised' });
+  }
+
+  const deviceId = req.query.device;
+  if (!deviceId || typeof deviceId !== 'string' || deviceId.length > 64) {
+    return res.status(400).json({ error: 'Missing or invalid device param' });
+  }
+
+  const secret = process.env.ESP_DEVICE_SECRET;
+  if (secret && req.headers['x-device-secret'] !== secret) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const customToken = await admin.auth().createCustomToken(deviceId, {
       deviceId,
       role: 'device',
     });
 
-    return res.json({ ok: true, token, deviceId });
+    const apiKey = process.env.FIREBASE_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: 'Server misconfigured: FIREBASE_API_KEY missing' });
+    }
+
+    const authRes = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: customToken,
+          returnSecureToken: true,
+        }),
+      }
+    );
+
+    const authData = await authRes.json();
+
+    if (!authRes.ok || !authData.idToken) {
+      console.error('[esp-token] ID token exchange failed:', authData);
+      return res.status(500).json({ error: 'Token exchange failed' });
+    }
+
+    return res.json({
+      ok: true,
+      token: authData.idToken,
+      deviceId,
+      expiresIn: Number(authData.expiresIn || 3600),
+    });
   } catch (err) {
     console.error('[esp-token] error:', err);
-    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    return res.status(500).json({ error: 'Token generation failed' });
   }
+});
+
+app.post('/ingest', async (req, res) => {
+  try {
+    const { deviceId, imageBase64 } = req.body || {};
+    if (!deviceId || !imageBase64) {
+      return res.status(400).json({ error: 'deviceId and imageBase64 are required' });
+    }
+
+    const frameBuffer = Buffer.from(imageBase64, 'base64');
+    ingestFrame(deviceId, frameBuffer);
+
+    ensureSession(deviceId);
+    await startSession(deviceId, {
+      successSeconds: 5,
+      timeoutSeconds: 180,
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[ingest] error:', err);
+    res.status(500).json({ error: 'ingest failed' });
+  }
+});
+
+app.get('/stream.mjpeg', (req, res) => {
+  const deviceId = req.query.deviceId;
+  if (!deviceId) {
+    return res.status(400).send('deviceId query param required');
+  }
+
+  res.writeHead(200, {
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache',
+    'Connection': 'close',
+    'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
+  });
+
+  const detach = attachViewer(deviceId, (frameBuffer) => {
+    try {
+      res.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${frameBuffer.length}\r\n\r\n`);
+      res.write(frameBuffer);
+      res.write('\r\n');
+    } catch (e) {
+      detach();
+      try {
+        res.end();
+      } catch (_) {}
+    }
+  });
+
+  const latest = getLatestFrameBuffer(deviceId);
+  if (latest) {
+    try {
+      res.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${latest.length}\r\n\r\n`);
+      res.write(latest);
+      res.write('\r\n');
+    } catch (_) {}
+  }
+
+  req.on('close', () => {
+    detach();
+  });
 });
 
 app.post('/sessions/:deviceId/start', async (req, res) => {
   try {
     const { deviceId } = req.params;
+    const successSeconds = Number(req.query.success_seconds || req.body?.successSeconds || 5);
+    const timeoutSeconds = Number(req.query.timeout_seconds || req.body?.timeoutSeconds || 180);
 
-    const successSeconds = parseOptionalNumber(
-      req.query.success_seconds ?? req.body?.success_seconds
-    );
-    const timeoutSeconds = parseOptionalNumber(
-      req.query.timeout_seconds ?? req.body?.timeout_seconds
-    );
-    const grams = parseOptionalInteger(
-      req.query.grams ?? req.body?.grams
-    );
-
-    const session = await startSession(deviceId, {
-      successSeconds,
-      timeoutSeconds,
-      grams,
-    });
-
-    return res.json({
-      ok: true,
-      message: 'Session started',
-      session,
-    });
+    await startSession(deviceId, { successSeconds, timeoutSeconds });
+    res.json({ ok: true, session: getSessionState(deviceId) });
   } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: String(err?.message || err),
-    });
+    console.error('[session start] error:', err);
+    res.status(500).json({ error: 'session start failed' });
   }
 });
 
 app.post('/sessions/:deviceId/stop', async (req, res) => {
   try {
     const { deviceId } = req.params;
-    await stopSession(deviceId, {
-      type: 'session_stopped',
-      reason: 'manual_stop',
-    });
-
-    return res.json({
-      ok: true,
-      message: 'Session stopped',
-      deviceId,
-    });
+    await stopSession(deviceId, { type: 'stopped' });
+    res.json({ ok: true, session: getSessionState(deviceId) });
   } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: String(err?.message || err),
-    });
+    console.error('[session stop] error:', err);
+    res.status(500).json({ error: 'session stop failed' });
   }
 });
 
-const server = http.createServer(app);
-
-const wssCamera = new WebSocketServer({ noServer: true });
-const wssAudioIngest = new WebSocketServer({ noServer: true });
-const wssAudioStream = new WebSocketServer({ noServer: true });
-
-wssCamera.on('connection', (ws) => {
-  ws.deviceId = null;
-  ws.autoSessionStarted = false;
-  ws.isAlive = true;
-
-  ws.on('pong', () => {
-    ws.isAlive = true;
-  });
-
-  ws.on('message', async (data, isBinary) => {
-    try {
-      if (!isBinary) {
-        const text = data.toString('utf8');
-
-        let msg;
-        try {
-          msg = JSON.parse(text);
-        } catch {
-          return;
-        }
-
-        if (msg?.type === 'hello' && msg?.deviceId) {
-          ws.deviceId = msg.deviceId;
-          await startSessionOnce(ws);
-        }
-
-        return;
-      }
-
-      if (!ws.deviceId) {
-        return;
-      }
-
-      const frameBuffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
-      streamStore.setLatestFrame(ws.deviceId, frameBuffer);
-      await startSessionOnce(ws);
-    } catch (err) {
-      console.error('[camera ws] message handling error:', err);
-    }
-  });
-
-  ws.on('error', (err) => {
-    console.error('[camera ws] socket error', {
-      deviceId: ws.deviceId,
-      error: err.message,
-    });
-  });
+app.get('/sessions/:deviceId', (req, res) => {
+  const { deviceId } = req.params;
+  res.json(getSessionState(deviceId) || null);
 });
 
-wssAudioIngest.on('connection', (ws) => {
-  console.log('Audio ingest connected');
-  audioStore.clearChunks();
-  debugChunks = [];
-  debugCapturing = true;
-
-  let srcRate = null;
-  let bigEndian = false;
-  ws.isAlive = true;
-
-  ws.on('pong', () => {
-    ws.isAlive = true;
-  });
-
-  ws.on('message', (data, isBinary) => {
-    if (!isBinary) {
-      const msg = data.toString().trim();
-
-      if (msg.startsWith('sampleRate:')) {
-        const rate = parseInt(msg.split(':')[1], 10);
-        if (rate > 0 && rate <= 192000) {
-          srcRate = rate;
-          console.log(`Audio ingest: sample rate set to ${srcRate} Hz`);
-        }
-        return;
-      }
-
-      if (msg.startsWith('bigEndian:')) {
-        bigEndian = msg.split(':')[1].trim() === 'true';
-        console.log(`Audio ingest: bigEndian=${bigEndian}`);
-        return;
-      }
-
-      if (msg === 'stop') {
-        console.log('Audio ingest: stop signal received');
-        audioStore.clearChunks();
-        wssAudioStream.clients.forEach((client) => {
-          if (client.readyState === client.OPEN) client.send('stop', { binary: false });
-        });
-        flushDebugAudio();
-        return;
-      }
-
-      console.warn(`Audio ingest: unknown text message "${msg}"`);
-      return;
-    }
-
-    if (srcRate === null) {
-      console.warn('Audio ingest: received PCM before sampleRate handshake, dropping');
-      return;
-    }
-
-    let rawBuf = Buffer.from(data);
-    if (bigEndian) rawBuf = swapBytes(rawBuf);
-
-    if (debugCapturing) debugChunks.push(Buffer.from(rawBuf));
-
-    const outBuf = processAudio(resamplePCM(rawBuf, srcRate));
-    audioStore.setLatestChunk(outBuf);
-    wssAudioStream.clients.forEach((client) => {
-      if (client.readyState === client.OPEN) client.send(outBuf, { binary: true });
-    });
-  });
-
-  ws.on('close', () => {
-    console.log('Audio ingest disconnected');
-    audioStore.clearChunks();
-    wssAudioStream.clients.forEach((client) => {
-      if (client.readyState === client.OPEN) client.send('stop', { binary: false });
-    });
-    flushDebugAudio();
-  });
-
-  ws.on('error', (err) => console.error('Audio ingest WS error:', err));
+app.get('/sessions', (_req, res) => {
+  res.json(getAllSessionsState());
 });
 
-wssAudioStream.on('connection', (ws) => {
-  console.log('ESP32 audio stream connected');
-  ws.isAlive = true;
-  ws.on('pong', () => {
-    ws.isAlive = true;
-  });
-  ws.on('error', (err) => console.error('Audio stream WS error:', err));
-  ws.on('close', () => console.log('ESP32 audio stream disconnected'));
-});
-
-server.on('upgrade', (request, socket, head) => {
-  const { pathname } = new URL(request.url, `http://${request.headers.host}`);
-
-  if (pathname === '/ingest') {
-    wssCamera.handleUpgrade(request, socket, head, (ws) => wssCamera.emit('connection', ws, request));
-  } else if (pathname === '/audio-ingest') {
-    wssAudioIngest.handleUpgrade(request, socket, head, (ws) => wssAudioIngest.emit('connection', ws, request));
-  } else if (pathname === '/audio-stream') {
-    wssAudioStream.handleUpgrade(request, socket, head, (ws) => wssAudioStream.emit('connection', ws, request));
-  } else {
-    socket.destroy();
-  }
-});
-
-const heartbeat = setInterval(() => {
-  heartbeatAll(wssCamera);
-  heartbeatAll(wssAudioIngest);
-  heartbeatAll(wssAudioStream);
-}, 15000);
-
-server.on('close', () => clearInterval(heartbeat));
-
-server.listen(PORT, () => {
-  console.log(`websockets: listening on port ${PORT}`);
-});
-
-process.on('SIGTERM', () => {
-  console.log('websockets: received SIGTERM');
-  try { wssCamera.close(); } catch {}
-  try { wssAudioIngest.close(); } catch {}
-  try { wssAudioStream.close(); } catch {}
-  server.close(() => process.exit(0));
-});
-
-function bootstrapFirebase() {
-  const dbUrl = process.env.FIREBASE_DB_URL;
-  const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-
-  if (!dbUrl || !rawJson) {
-    console.log('Firebase not configured; running without Firebase');
-    return;
-  }
-
+app.post('/ml-result', async (req, res) => {
   try {
-    const serviceAccount = JSON.parse(rawJson);
-
-    if (!admin.apps.length) {
-      admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-        databaseURL: dbUrl,
-      });
+    const { deviceId, result, finalEvent } = req.body || {};
+    if (!deviceId || !result) {
+      return res.status(400).json({ error: 'deviceId and result are required' });
     }
 
-    initFirebase(admin, admin.database());
-    console.log('Firebase initialized');
+    setSessionMlResult(deviceId, result);
+
+    if (db) {
+      try {
+        await writeDeviceMlResult(db, deviceId, result, finalEvent || null);
+      } catch (err) {
+        console.error('[firebase] writeDeviceMlResult failed:', err.message);
+      }
+    }
+
+    if (finalEvent) {
+      await stopSession(deviceId, finalEvent);
+    }
+
+    res.json({ ok: true });
   } catch (err) {
-    console.error('Failed to initialize Firebase:', err);
+    console.error('[ml-result] error:', err);
+    res.status(500).json({ error: 'ml-result failed' });
   }
-}
+});
 
-async function startSessionOnce(ws) {
-  if (!ws?.deviceId) return;
-  if (ws.autoSessionStarted) return;
-
-  const existing = getPublicSession(ws.deviceId);
-  if (existing?.active) {
-    ws.autoSessionStarted = true;
-    return;
-  }
-
+app.post('/audio-stream', express.raw({ type: '*/*', limit: '10mb' }), (req, res) => {
   try {
-    await startSession(ws.deviceId, {
+    if (!req.body || !req.body.length) {
+      return res.status(400).json({ error: 'audio body required' });
+    }
+    setAudioChunk(Buffer.from(req.body));
+    res.json({ ok: true, bytes: req.body.length });
+  } catch (err) {
+    console.error('[audio-stream] error:', err);
+    res.status(500).json({ error: 'audio-stream failed' });
+  }
+});
+
+attachDebugAudioRoute(app);
+
+app.use(createApp({
+  getLatestFrameBuffer,
+  onFrame: async ({ deviceId, frameBuffer }) => {
+    ingestFrame(deviceId, frameBuffer);
+    ensureSession(deviceId);
+    await startSession(deviceId, {
       successSeconds: 5,
       timeoutSeconds: 180,
     });
-    ws.autoSessionStarted = true;
-  } catch (err) {
-    console.error('[session] auto-start failed:', err);
-  }
-}
+  },
+  onDisconnect: ({ deviceId }) => {
+    clearDevice(deviceId);
+  },
+  getMlServiceUrl: () => process.env.ML_SERVICE_URL || null,
+  onMlResult: async ({ deviceId, result, finalEvent }) => {
+    setSessionMlResult(deviceId, result);
 
-function parseOptionalNumber(value) {
-  if (value === undefined || value === null || value === '') return undefined;
-  const n = Number(value);
-  return Number.isFinite(n) ? n : undefined;
-}
-
-function parseOptionalInteger(value) {
-  if (value === undefined || value === null || value === '') return undefined;
-  const n = parseInt(String(value), 10);
-  return Number.isFinite(n) ? n : undefined;
-}
-
-function heartbeatAll(wss) {
-  wss.clients.forEach((ws) => {
-    if (!ws.isAlive) {
-      ws.terminate();
-      return;
+    if (db) {
+      try {
+        await writeDeviceMlResult(db, deviceId, result, finalEvent || null);
+      } catch (err) {
+        console.error('[firebase] writeDeviceMlResult failed:', err.message);
+      }
+      if (finalEvent) {
+        try {
+          await writeFeedEvent(db, deviceId, finalEvent);
+        } catch (err) {
+          console.error('[firebase] writeFeedEvent failed:', err.message);
+        }
+      }
     }
-    ws.isAlive = false;
-    ws.ping();
-  });
-}
 
-function swapBytes(buf) {
-  const out = Buffer.allocUnsafe(buf.length);
-  for (let i = 0; i + 1 < buf.length; i += 2) {
-    out[i] = buf[i + 1];
-    out[i + 1] = buf[i];
-  }
-  return out;
-}
+    if (finalEvent) {
+      await stopSession(deviceId, finalEvent);
+    }
+  },
+}));
 
-function resamplePCM(inputBuf, srcRate) {
-  if (srcRate === TARGET_RATE) return inputBuf;
-
-  const srcSamples = Math.floor(inputBuf.length / 2);
-  const ratio = srcRate / TARGET_RATE;
-  const dstSamples = Math.floor(srcSamples / ratio);
-  const outputBuf = Buffer.allocUnsafe(dstSamples * 2);
-
-  for (let i = 0; i < dstSamples; i++) {
-    const srcPos = i * ratio;
-    const srcIdx = Math.floor(srcPos);
-    const frac = srcPos - srcIdx;
-
-    const idx1 = Math.min(srcIdx, srcSamples - 1);
-    const idx2 = Math.min(srcIdx + 1, srcSamples - 1);
-
-    const s1 = inputBuf.readInt16LE(idx1 * 2);
-    const s2 = inputBuf.readInt16LE(idx2 * 2);
-    const interpolated = Math.round(s1 + (s2 - s1) * frac);
-    outputBuf.writeInt16LE(interpolated, i * 2);
-  }
-
-  return outputBuf;
-}
-
-function processAudio(buf) {
-  return buf;
-}
-
-function flushDebugAudio() {
-  if (!debugCapturing || debugChunks.length === 0) {
-    debugChunks = [];
-    debugCapturing = false;
-    return;
-  }
-
-  try {
-    const combined = Buffer.concat(debugChunks);
-    writeWav(combined, TARGET_RATE, path.join('/tmp', 'debug_audio.wav'));
-  } catch (e) {
-    console.error('Failed to write debug WAV:', e.message);
-  }
-  debugChunks = [];
-  debugCapturing = false;
-}
-
-function writeWav(pcm16leBuf, sampleRate, filePath) {
-  const numChannels = 1;
-  const bitsPerSample = 16;
-  const blockAlign = numChannels * bitsPerSample / 8;
-  const byteRate = sampleRate * blockAlign;
-  const dataSize = pcm16leBuf.length;
-  const header = Buffer.alloc(44);
-
-  header.write('RIFF', 0);
-  header.writeUInt32LE(36 + dataSize, 4);
-  header.write('WAVE', 8);
-  header.write('fmt ', 12);
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(numChannels, 22);
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(blockAlign, 32);
-  header.writeUInt16LE(bitsPerSample, 34);
-  header.write('data', 36);
-  header.writeUInt32LE(dataSize, 40);
-
-  fs.writeFileSync(filePath, Buffer.concat([header, pcm16leBuf]));
-}
+const port = Number(process.env.PORT || 8080);
+app.listen(port, () => {
+  console.log(`websockets: listening on port ${port}`);
+});
