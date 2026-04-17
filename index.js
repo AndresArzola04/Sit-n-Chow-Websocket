@@ -208,13 +208,7 @@ server.listen(PORT, () => {
 
 function bootstrapFirebase() {
   const dbUrl = process.env.FIREBASE_DB_URL;
-  //const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-
-  const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON || process.env.FIREBASE_SERVICE_ACCOUNT;
-
-  console.log('FIREBASE_DB_URL exists:', !!process.env.FIREBASE_DB_URL);
-  console.log('FIREBASE_SERVICE_ACCOUNT exists:', !!process.env.FIREBASE_SERVICE_ACCOUNT);
-  console.log('FIREBASE_SERVICE_ACCOUNT_JSON exists:', !!process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+  const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
 
   if (!dbUrl || !rawJson) {
     console.log('Firebase not configured; running without Firebase');
