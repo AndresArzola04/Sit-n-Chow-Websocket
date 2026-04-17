@@ -23,7 +23,6 @@ async function writeMlStatus(deviceId, result) {
 
 module.exports = {
   initFirebase,
-  writeDispenseCommand,
   writeFeedEvent,
   writeMlStatus,
 };
