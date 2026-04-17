@@ -208,7 +208,7 @@ server.listen(PORT, () => {
 
 function bootstrapFirebase() {
   const dbUrl = process.env.FIREBASE_DB_URL;
-  const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  //const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
 
   const rawJson =process.env.FIREBASE_SERVICE_ACCOUNT_JSON || process.env.FIREBASE_SERVICE_ACCOUNT;
 
