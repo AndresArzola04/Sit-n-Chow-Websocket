@@ -210,6 +210,9 @@ function bootstrapFirebase() {
   const dbUrl = process.env.FIREBASE_DB_URL;
   const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
 
+  console.log('FIREBASE_DB_URL exists:', !!process.env.FIREBASE_DB_URL);
+  console.log('FIREBASE_SERVICE_ACCOUNT exists:', !!process.env.FIREBASE_SERVICE_ACCOUNT);
+
   if (!dbUrl || !rawJson) {
     console.log('Firebase not configured; running without Firebase');
     return;
