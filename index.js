@@ -3,34 +3,20 @@ const fetch = require('node-fetch');
 
 const {
   initFirebase,
-  writeFeedEvent,
-  writeMlStatus,
 } = require('./firebaseActions');
-const { createApp } = require('./app');
-const { attachDebugAudioRoute, setAudioChunk } = require('./audioStore');
-const {
-  ingestFrame,
-  getLatestFrameBuffer,
-  attachViewer,
-  clearDevice,
-} = require('./streamStore');
-const {
-  ensureSession,
-  startSession,
-  stopSession,
-  getSessionState,
-  getAllSessionsState,
-  setSessionMlResult,
-} = require('./sessionManager');
+const { setLatestChunk } = require('./audioStore');
+const { startSession, stopSession, getPublicSession, listSessions } = require('./sessionManager');
+const streamStore = require('./streamStore');
+const baseApp = require('./app');
 
 const app = express();
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '10mb' }));
 
 const firebase = initFirebase();
 const admin = firebase?.admin || null;
 const db = firebase?.db || null;
 
-app.get('/health', (_req, res) => {
+app.get('/healthz', (_req, res) => {
   res.json({
     ok: true,
     firebase: !!db,
@@ -103,59 +89,18 @@ app.post('/ingest', async (req, res) => {
     }
 
     const frameBuffer = Buffer.from(imageBase64, 'base64');
-    ingestFrame(deviceId, frameBuffer);
+    streamStore.setLatestFrame(deviceId, frameBuffer);
 
-    ensureSession(deviceId);
     await startSession(deviceId, {
       successSeconds: 5,
       timeoutSeconds: 180,
     });
 
-    res.json({ ok: true });
+    return res.json({ ok: true });
   } catch (err) {
     console.error('[ingest] error:', err);
-    res.status(500).json({ error: 'ingest failed' });
+    return res.status(500).json({ error: 'ingest failed' });
   }
-});
-
-app.get('/stream.mjpeg', (req, res) => {
-  const deviceId = req.query.deviceId;
-  if (!deviceId) {
-    return res.status(400).send('deviceId query param required');
-  }
-
-  res.writeHead(200, {
-    'Cache-Control': 'no-cache',
-    'Pragma': 'no-cache',
-    'Connection': 'close',
-    'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
-  });
-
-  const detach = attachViewer(deviceId, (frameBuffer) => {
-    try {
-      res.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${frameBuffer.length}\r\n\r\n`);
-      res.write(frameBuffer);
-      res.write('\r\n');
-    } catch (e) {
-      detach();
-      try {
-        res.end();
-      } catch (_) {}
-    }
-  });
-
-  const latest = getLatestFrameBuffer(deviceId);
-  if (latest) {
-    try {
-      res.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${latest.length}\r\n\r\n`);
-      res.write(latest);
-      res.write('\r\n');
-    } catch (_) {}
-  }
-
-  req.on('close', () => {
-    detach();
-  });
 });
 
 app.post('/sessions/:deviceId/start', async (req, res) => {
@@ -165,10 +110,10 @@ app.post('/sessions/:deviceId/start', async (req, res) => {
     const timeoutSeconds = Number(req.query.timeout_seconds || req.body?.timeoutSeconds || 180);
 
     await startSession(deviceId, { successSeconds, timeoutSeconds });
-    res.json({ ok: true, session: getSessionState(deviceId) });
+    return res.json({ ok: true, session: getPublicSession(deviceId) });
   } catch (err) {
     console.error('[session start] error:', err);
-    res.status(500).json({ error: 'session start failed' });
+    return res.status(500).json({ error: 'session start failed' });
   }
 });
 
@@ -176,109 +121,37 @@ app.post('/sessions/:deviceId/stop', async (req, res) => {
   try {
     const { deviceId } = req.params;
     await stopSession(deviceId, { type: 'stopped' });
-    res.json({ ok: true, session: getSessionState(deviceId) });
+    return res.json({ ok: true, session: getPublicSession(deviceId) });
   } catch (err) {
     console.error('[session stop] error:', err);
-    res.status(500).json({ error: 'session stop failed' });
+    return res.status(500).json({ error: 'session stop failed' });
   }
 });
 
 app.get('/sessions/:deviceId', (req, res) => {
   const { deviceId } = req.params;
-  res.json(getSessionState(deviceId) || null);
+  return res.json(getPublicSession(deviceId) || null);
 });
 
 app.get('/sessions', (_req, res) => {
-  res.json(getAllSessionsState());
+  return res.json(listSessions());
 });
 
-app.post('/ml-result', async (req, res) => {
-  try {
-    const { deviceId, result, finalEvent } = req.body || {};
-    if (!deviceId || !result) {
-      return res.status(400).json({ error: 'deviceId and result are required' });
-    }
-
-    setSessionMlResult(deviceId, result);
-
-    if (db) {
-      try {
-        await writeMlStatus(
-          deviceId,
-          finalEvent ? { ...result, event: finalEvent } : result
-        );
-      } catch (err) {
-        console.error('[firebase] writeMlStatus failed:', err.message);
-      }
-    }
-
-    if (finalEvent) {
-      await stopSession(deviceId, finalEvent);
-    }
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error('[ml-result] error:', err);
-    res.status(500).json({ error: 'ml-result failed' });
-  }
-});
-
-app.post('/audio-stream', express.raw({ type: '*/*', limit: '10mb' }), (req, res) => {
+app.post('/audio-ingest', express.raw({ type: '*/*', limit: '10mb' }), (req, res) => {
   try {
     if (!req.body || !req.body.length) {
       return res.status(400).json({ error: 'audio body required' });
     }
-    setAudioChunk(Buffer.from(req.body));
-    res.json({ ok: true, bytes: req.body.length });
+
+    setLatestChunk(Buffer.from(req.body));
+    return res.json({ ok: true, bytes: req.body.length });
   } catch (err) {
-    console.error('[audio-stream] error:', err);
-    res.status(500).json({ error: 'audio-stream failed' });
+    console.error('[audio-ingest] error:', err);
+    return res.status(500).json({ error: 'audio-ingest failed' });
   }
 });
 
-attachDebugAudioRoute(app);
-
-app.use(createApp({
-  getLatestFrameBuffer,
-  onFrame: async ({ deviceId, frameBuffer }) => {
-    ingestFrame(deviceId, frameBuffer);
-    ensureSession(deviceId);
-    await startSession(deviceId, {
-      successSeconds: 5,
-      timeoutSeconds: 180,
-    });
-  },
-  onDisconnect: ({ deviceId }) => {
-    clearDevice(deviceId);
-  },
-  getMlServiceUrl: () => process.env.ML_SERVICE_URL || null,
-  onMlResult: async ({ deviceId, result, finalEvent }) => {
-    setSessionMlResult(deviceId, result);
-
-    if (db) {
-      try {
-        await writeMlStatus(
-          deviceId,
-          finalEvent ? { ...result, event: finalEvent } : result
-        );
-      } catch (err) {
-        console.error('[firebase] writeMlStatus failed:', err.message);
-      }
-
-      if (finalEvent) {
-        try {
-          await writeFeedEvent(deviceId, finalEvent);
-        } catch (err) {
-          console.error('[firebase] writeFeedEvent failed:', err.message);
-        }
-      }
-    }
-
-    if (finalEvent) {
-      await stopSession(deviceId, finalEvent);
-    }
-  },
-}));
+app.use(baseApp);
 
 const port = Number(process.env.PORT || 8080);
 app.listen(port, () => {
