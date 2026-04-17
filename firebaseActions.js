@@ -8,12 +8,7 @@ function initFirebase(firebaseAdmin, database) {
 
 async function writeFeedEvent(deviceId, event) {
   if (!db) return;
-
-  const ref = db.ref(`feedEvents/${deviceId}`).push();
-  await ref.set({
-    ...event,
-    ts: event.ts ?? Date.now(),
-  });
+  await db.ref(`feedEvents/${deviceId}`).set(event);
 }
 
 async function writeMlStatus(deviceId, result) {
