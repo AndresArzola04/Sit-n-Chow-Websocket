@@ -1,11 +1,10 @@
 const express = require('express');
-const { Readable } = require('stream');
 const fetch = require('node-fetch');
 
 const {
   initFirebase,
   writeFeedEvent,
-  writeDeviceMlResult,
+  writeMlStatus,
 } = require('./firebaseActions');
 const { createApp } = require('./app');
 const { attachDebugAudioRoute, setAudioChunk } = require('./audioStore');
@@ -22,7 +21,6 @@ const {
   getSessionState,
   getAllSessionsState,
   setSessionMlResult,
-  attachSessionManager,
 } = require('./sessionManager');
 
 const app = express();
@@ -31,24 +29,6 @@ app.use(express.json({ limit: '2mb' }));
 const firebase = initFirebase();
 const admin = firebase?.admin || null;
 const db = firebase?.db || null;
-
-attachSessionManager({
-  onFinal: async ({ deviceId, finalEvent, lastResult }) => {
-    console.log(`[session] final for ${deviceId}:`, finalEvent);
-    if (db) {
-      try {
-        await writeFeedEvent(db, deviceId, finalEvent);
-      } catch (err) {
-        console.error('[firebase] writeFeedEvent failed:', err.message);
-      }
-      try {
-        await writeDeviceMlResult(db, deviceId, lastResult, finalEvent);
-      } catch (err) {
-        console.error('[firebase] writeDeviceMlResult failed:', err.message);
-      }
-    }
-  },
-});
 
 app.get('/health', (_req, res) => {
   res.json({
@@ -223,9 +203,12 @@ app.post('/ml-result', async (req, res) => {
 
     if (db) {
       try {
-        await writeDeviceMlResult(db, deviceId, result, finalEvent || null);
+        await writeMlStatus(
+          deviceId,
+          finalEvent ? { ...result, event: finalEvent } : result
+        );
       } catch (err) {
-        console.error('[firebase] writeDeviceMlResult failed:', err.message);
+        console.error('[firebase] writeMlStatus failed:', err.message);
       }
     }
 
@@ -274,13 +257,17 @@ app.use(createApp({
 
     if (db) {
       try {
-        await writeDeviceMlResult(db, deviceId, result, finalEvent || null);
+        await writeMlStatus(
+          deviceId,
+          finalEvent ? { ...result, event: finalEvent } : result
+        );
       } catch (err) {
-        console.error('[firebase] writeDeviceMlResult failed:', err.message);
+        console.error('[firebase] writeMlStatus failed:', err.message);
       }
+
       if (finalEvent) {
         try {
-          await writeFeedEvent(db, deviceId, finalEvent);
+          await writeFeedEvent(deviceId, finalEvent);
         } catch (err) {
           console.error('[firebase] writeFeedEvent failed:', err.message);
         }
