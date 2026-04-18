@@ -38,7 +38,7 @@ function initFirebase() {
 
 async function writeFeedEvent(deviceId, event) {
   if (!db) return;
-  await db.ref(`feedEvents/${deviceId}`).set(event);
+  await db.ref(`final_output/${deviceId}`).set(event);
 }
 
 async function writeMlStatus(deviceId, result) {
