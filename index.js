@@ -1,10 +1,13 @@
 const express = require('express');
 const fetch = require('node-fetch');
+const http = require('http');
+const { WebSocketServer } = require('ws');
+const url = require('url');
 
 const {
   initFirebase,
 } = require('./firebaseActions');
-const { setLatestChunk } = require('./audioStore');
+const { setLatestChunk, clearChunks } = require('./audioStore');
 const { startSession, stopSession, getPublicSession, listSessions } = require('./sessionManager');
 const streamStore = require('./streamStore');
 const baseApp = require('./app');
@@ -16,11 +19,69 @@ const firebase = initFirebase();
 const admin = firebase?.admin || null;
 const db = firebase?.db || null;
 
+// ESP audio listeners keyed by deviceId
+const audioClientsByDevice = new Map(); // deviceId -> Set<ws>
+
+function addAudioClient(deviceId, ws) {
+  if (!deviceId) return;
+  let set = audioClientsByDevice.get(deviceId);
+  if (!set) {
+    set = new Set();
+    audioClientsByDevice.set(deviceId, set);
+  }
+  set.add(ws);
+}
+
+function removeAudioClient(deviceId, ws) {
+  if (!deviceId) return;
+  const set = audioClientsByDevice.get(deviceId);
+  if (!set) return;
+  set.delete(ws);
+  if (set.size === 0) {
+    audioClientsByDevice.delete(deviceId);
+  }
+}
+
+function broadcastAudioChunk(deviceId, chunk) {
+  const set = audioClientsByDevice.get(deviceId);
+  if (!set || !set.size) return 0;
+
+  let sent = 0;
+  for (const ws of set) {
+    if (ws.readyState !== ws.OPEN) continue;
+    try {
+      ws.send(chunk, { binary: true });
+      sent++;
+    } catch (err) {
+      console.error('[audio-stream] send error:', err.message);
+    }
+  }
+  return sent;
+}
+
+function sendAudioStop(deviceId) {
+  const set = audioClientsByDevice.get(deviceId);
+  if (!set || !set.size) return 0;
+
+  let sent = 0;
+  for (const ws of set) {
+    if (ws.readyState !== ws.OPEN) continue;
+    try {
+      ws.send('stop');
+      sent++;
+    } catch (err) {
+      console.error('[audio-stop] send error:', err.message);
+    }
+  }
+  return sent;
+}
+
 app.get('/healthz', (_req, res) => {
   res.json({
     ok: true,
     firebase: !!db,
     mlServiceUrl: process.env.ML_SERVICE_URL || null,
+    audioDevicesConnected: Array.from(audioClientsByDevice.keys()),
   });
 });
 
@@ -137,23 +198,109 @@ app.get('/sessions', (_req, res) => {
   return res.json(listSessions());
 });
 
+// Mobile app uploads raw PCM here over HTTPS POST
 app.post('/audio-ingest', express.raw({ type: '*/*', limit: '10mb' }), (req, res) => {
   try {
+    const deviceId =
+      req.query.deviceId ||
+      req.headers['x-device-id'] ||
+      req.headers['x-device'] ||
+      '';
+
+    if (!deviceId) {
+      return res.status(400).json({ error: 'deviceId is required' });
+    }
+
     if (!req.body || !req.body.length) {
       return res.status(400).json({ error: 'audio body required' });
     }
 
-    setLatestChunk(Buffer.from(req.body));
-    return res.json({ ok: true, bytes: req.body.length });
+    const chunk = Buffer.from(req.body);
+    setLatestChunk(chunk);
+
+    const sent = broadcastAudioChunk(deviceId, chunk);
+    return res.json({
+      ok: true,
+      bytes: req.body.length,
+      deviceId,
+      listeners: sent,
+    });
   } catch (err) {
     console.error('[audio-ingest] error:', err);
     return res.status(500).json({ error: 'audio-ingest failed' });
   }
 });
 
+// Mobile app tells ESP playback to start
+app.post('/audio-stop', express.json(), (req, res) => {
+  try {
+    const deviceId =
+      req.query.deviceId ||
+      req.body?.deviceId ||
+      req.headers['x-device-id'] ||
+      req.headers['x-device'] ||
+      '';
+
+    if (!deviceId) {
+      return res.status(400).json({ error: 'deviceId is required' });
+    }
+
+    const sent = sendAudioStop(deviceId);
+    clearChunks();
+
+    return res.json({
+      ok: true,
+      deviceId,
+      listeners: sent,
+    });
+  } catch (err) {
+    console.error('[audio-stop] error:', err);
+    return res.status(500).json({ error: 'audio-stop failed' });
+  }
+});
+
 app.use(baseApp);
 
+const server = http.createServer(app);
+const audioWss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+  const parsed = url.parse(req.url, true);
+
+  if (parsed.pathname !== '/audio-stream') {
+    socket.destroy();
+    return;
+  }
+
+  const deviceId = parsed.query.device;
+  if (!deviceId || typeof deviceId !== 'string') {
+    socket.destroy();
+    return;
+  }
+
+  audioWss.handleUpgrade(req, socket, head, (ws) => {
+    ws.deviceId = deviceId;
+    addAudioClient(deviceId, ws);
+
+    console.log(`[audio-stream] ESP connected for device ${deviceId}`);
+
+    ws.on('close', () => {
+      removeAudioClient(deviceId, ws);
+      console.log(`[audio-stream] ESP disconnected for device ${deviceId}`);
+    });
+
+    ws.on('error', (err) => {
+      console.error(`[audio-stream] WS error for ${deviceId}:`, err.message);
+      removeAudioClient(deviceId, ws);
+    });
+
+    try {
+      ws.send(JSON.stringify({ ok: true, type: 'connected', deviceId }));
+    } catch (_) {}
+  });
+});
+
 const port = Number(process.env.PORT || 8080);
-app.listen(port, () => {
+server.listen(port, () => {
   console.log(`websockets: listening on port ${port}`);
 });
