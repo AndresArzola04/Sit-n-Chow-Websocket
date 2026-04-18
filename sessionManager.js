@@ -97,8 +97,12 @@ async function startSession(deviceId, options = {}) {
   console.log(`[session] started ${deviceId}`);
 
   await writeFeedEvent(deviceId, {
-    type: 'session_started',
-    source: 'websocket-backend',
+    status: 'running',
+    event: { type: 'session_started' },
+    session_started_at: session.startedAt,
+    timeout_seconds: session.timeoutSeconds,
+    success_seconds: session.successSeconds,
+    updatedAt: Date.now(),
   });
 
   await writeMlStatus(deviceId, {
@@ -267,8 +271,7 @@ async function finishSession(deviceId, event) {
 
   await writeMlStatus(deviceId, finalPayload);
   await writeFeedEvent(deviceId, {
-    ...event,
-    source: 'websocket-backend',
+    ...finalPayload,
   });
 
   if (event.type === 'sit_success') {
