@@ -4,9 +4,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 const url = require('url');
 
-const {
-  initFirebase,
-} = require('./firebaseActions');
+const { initFirebase } = require('./firebaseActions');
 const { setLatestChunk, clearChunks } = require('./audioStore');
 const { startSession, stopSession, getPublicSession, listSessions } = require('./sessionManager');
 const streamStore = require('./streamStore');
@@ -21,6 +19,9 @@ const db = firebase?.db || null;
 
 // ESP audio listeners keyed by deviceId
 const audioClientsByDevice = new Map(); // deviceId -> Set<ws>
+
+// ESP camera websocket clients keyed by deviceId
+const cameraClientsByDevice = new Map(); // deviceId -> ws
 
 function addAudioClient(deviceId, ws) {
   if (!deviceId) return;
@@ -76,12 +77,26 @@ function sendAudioStop(deviceId) {
   return sent;
 }
 
+function setCameraClient(deviceId, ws) {
+  if (!deviceId) return;
+  cameraClientsByDevice.set(deviceId, ws);
+}
+
+function removeCameraClient(deviceId, ws) {
+  if (!deviceId) return;
+  const existing = cameraClientsByDevice.get(deviceId);
+  if (existing === ws) {
+    cameraClientsByDevice.delete(deviceId);
+  }
+}
+
 app.get('/healthz', (_req, res) => {
   res.json({
     ok: true,
     firebase: !!db,
     mlServiceUrl: process.env.ML_SERVICE_URL || null,
     audioDevicesConnected: Array.from(audioClientsByDevice.keys()),
+    cameraDevicesConnected: Array.from(cameraClientsByDevice.keys()),
   });
 });
 
@@ -142,6 +157,7 @@ app.get('/esp-token', async (req, res) => {
   }
 });
 
+// Optional HTTP ingest support
 app.post('/ingest', async (req, res) => {
   try {
     const { deviceId, imageBase64 } = req.body || {};
@@ -231,7 +247,6 @@ app.post('/audio-ingest', express.raw({ type: '*/*', limit: '10mb' }), (req, res
   }
 });
 
-// Mobile app tells ESP playback to start
 app.post('/audio-stop', express.json(), (req, res) => {
   try {
     const deviceId =
@@ -262,42 +277,111 @@ app.post('/audio-stop', express.json(), (req, res) => {
 app.use(baseApp);
 
 const server = http.createServer(app);
+
 const audioWss = new WebSocketServer({ noServer: true });
+const ingestWss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
   const parsed = url.parse(req.url, true);
 
-  if (parsed.pathname !== '/audio-stream') {
-    socket.destroy();
+  if (parsed.pathname === '/audio-stream') {
+    const deviceId = parsed.query.device;
+    if (!deviceId || typeof deviceId !== 'string') {
+      socket.destroy();
+      return;
+    }
+
+    audioWss.handleUpgrade(req, socket, head, (ws) => {
+      ws.deviceId = deviceId;
+      addAudioClient(deviceId, ws);
+
+      console.log(`[audio-stream] ESP connected for device ${deviceId}`);
+
+      ws.on('close', () => {
+        removeAudioClient(deviceId, ws);
+        console.log(`[audio-stream] ESP disconnected for device ${deviceId}`);
+      });
+
+      ws.on('error', (err) => {
+        console.error(`[audio-stream] WS error for ${deviceId}:`, err.message);
+        removeAudioClient(deviceId, ws);
+      });
+
+      try {
+        ws.send(JSON.stringify({ ok: true, type: 'connected', deviceId }));
+      } catch (_) {}
+    });
     return;
   }
 
-  const deviceId = parsed.query.device;
-  if (!deviceId || typeof deviceId !== 'string') {
-    socket.destroy();
+  if (parsed.pathname === '/ingest') {
+    ingestWss.handleUpgrade(req, socket, head, (ws) => {
+      let deviceId = null;
+
+      console.log('[ingest] camera websocket connected');
+
+      ws.on('message', async (data, isBinary) => {
+        try {
+          if (!isBinary) {
+            const text = data.toString();
+
+            try {
+              const msg = JSON.parse(text);
+              if (msg.type === 'hello' && msg.deviceId) {
+                deviceId = msg.deviceId;
+                setCameraClient(deviceId, ws);
+
+                console.log(`[ingest] hello from device ${deviceId}`);
+
+                await startSession(deviceId, {
+                  successSeconds: 5,
+                  timeoutSeconds: 180,
+                });
+              }
+            } catch (_) {
+              // ignore non-JSON text messages
+            }
+
+            return;
+          }
+
+          if (!deviceId) {
+            console.warn('[ingest] binary frame received before hello/deviceId');
+            return;
+          }
+
+          const frameBuffer = Buffer.from(data);
+          streamStore.setLatestFrame(deviceId, frameBuffer);
+
+          await startSession(deviceId, {
+            successSeconds: 5,
+            timeoutSeconds: 180,
+          });
+        } catch (err) {
+          console.error('[ingest] websocket message error:', err.message);
+        }
+      });
+
+      ws.on('close', () => {
+        if (deviceId) {
+          removeCameraClient(deviceId, ws);
+          console.log(`[ingest] camera websocket disconnected for ${deviceId}`);
+        } else {
+          console.log('[ingest] camera websocket disconnected');
+        }
+      });
+
+      ws.on('error', (err) => {
+        console.error('[ingest] camera websocket error:', err.message);
+        if (deviceId) {
+          removeCameraClient(deviceId, ws);
+        }
+      });
+    });
     return;
   }
 
-  audioWss.handleUpgrade(req, socket, head, (ws) => {
-    ws.deviceId = deviceId;
-    addAudioClient(deviceId, ws);
-
-    console.log(`[audio-stream] ESP connected for device ${deviceId}`);
-
-    ws.on('close', () => {
-      removeAudioClient(deviceId, ws);
-      console.log(`[audio-stream] ESP disconnected for device ${deviceId}`);
-    });
-
-    ws.on('error', (err) => {
-      console.error(`[audio-stream] WS error for ${deviceId}:`, err.message);
-      removeAudioClient(deviceId, ws);
-    });
-
-    try {
-      ws.send(JSON.stringify({ ok: true, type: 'connected', deviceId }));
-    } catch (_) {}
-  });
+  socket.destroy();
 });
 
 const port = Number(process.env.PORT || 8080);
