@@ -96,15 +96,6 @@ async function startSession(deviceId, options = {}) {
   sessions.set(deviceId, session);
   console.log(`[session] started ${deviceId}`);
 
-  await writeFeedEvent(deviceId, {
-    status: 'running',
-    event: { type: 'session_started' },
-    session_started_at: session.startedAt,
-    timeout_seconds: session.timeoutSeconds,
-    success_seconds: session.successSeconds,
-    updatedAt: Date.now(),
-  });
-
   await writeMlStatus(deviceId, {
     status: 'running',
     event: { type: 'session_started' },
