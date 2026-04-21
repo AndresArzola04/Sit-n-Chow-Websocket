@@ -23,9 +23,6 @@ const audioClientsByDevice = new Map(); // deviceId -> Set<ws>
 // ESP camera websocket clients keyed by deviceId
 const cameraClientsByDevice = new Map(); // deviceId -> ws
 
-// --------------------------------------------------------------------------
-// DEBUG HELPER — logs a snapshot of all registered audio clients
-// --------------------------------------------------------------------------
 function debugAudioClients(label) {
   if (audioClientsByDevice.size === 0) {
     console.debug(`[audio-debug][${label}] No ESP audio clients registered`);
@@ -58,7 +55,6 @@ function removeAudioClient(deviceId, ws) {
 }
 
 function broadcastAudioChunk(deviceId, chunk) {
-  // DEBUG: show all registered devices so you can spot a name mismatch
   if (audioClientsByDevice.size === 0) {
     console.warn(`[audio-broadcast] No ESP clients registered at all — did the ESP connect to /audio-stream?device=<id>?`);
     return 0;
@@ -134,15 +130,11 @@ app.get('/healthz', (_req, res) => {
   });
 });
 
-// --------------------------------------------------------------------------
-// DEBUG ENDPOINT — dump full audio client state without restarting the server
-// Hit GET /audio-debug to inspect live state at any time
-// --------------------------------------------------------------------------
 app.get('/audio-debug', (_req, res) => {
   const devices = {};
   for (const [id, set] of audioClientsByDevice) {
     devices[id] = Array.from(set).map((ws) => ({
-      readyState: ws.readyState, // 0=CONNECTING 1=OPEN 2=CLOSING 3=CLOSED
+      readyState: ws.readyState,
       readyStateLabel: ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'][ws.readyState] ?? 'UNKNOWN',
     }));
   }
@@ -211,7 +203,6 @@ app.get('/esp-token', async (req, res) => {
   }
 });
 
-// Optional HTTP ingest support
 app.post('/ingest', async (req, res) => {
   try {
     const { deviceId, imageBase64 } = req.body || {};
@@ -222,10 +213,7 @@ app.post('/ingest', async (req, res) => {
     const frameBuffer = Buffer.from(imageBase64, 'base64');
     streamStore.setLatestFrame(deviceId, frameBuffer);
 
-    await startSession(deviceId, {
-      successSeconds: 5,
-      timeoutSeconds: 180,
-    });
+    await startSession(deviceId);
 
     return res.json({ ok: true });
   } catch (err) {
@@ -237,10 +225,8 @@ app.post('/ingest', async (req, res) => {
 app.post('/sessions/:deviceId/start', async (req, res) => {
   try {
     const { deviceId } = req.params;
-    const successSeconds = Number(req.query.success_seconds || req.body?.successSeconds || 5);
-    const timeoutSeconds = Number(req.query.timeout_seconds || req.body?.timeoutSeconds || 180);
 
-    await startSession(deviceId, { successSeconds, timeoutSeconds });
+    await startSession(deviceId);
     return res.json({ ok: true, session: getPublicSession(deviceId) });
   } catch (err) {
     console.error('[session start] error:', err);
@@ -268,19 +254,11 @@ app.get('/sessions', (_req, res) => {
   return res.json(listSessions());
 });
 
-// Mobile app uploads raw PCM here over HTTPS POST
-// IMPORTANT: deviceId must match the ?device= param the ESP used when opening
-// the /audio-stream WebSocket. Accepts both ?deviceId= and ?device= so either
-// side can use whichever name they prefer.
 app.post('/audio-ingest', express.raw({ type: '*/*', limit: '10mb' }), (req, res) => {
   try {
-    // -----------------------------------------------------------------------
-    // FIX: accept both ?deviceId= (camelCase) AND ?device= (what /audio-stream
-    // uses) so a param-name mismatch can't silently break delivery.
-    // -----------------------------------------------------------------------
     const deviceId =
       req.query.deviceId ||
-      req.query.device ||          // ← added: matches /audio-stream's param name
+      req.query.device ||
       req.headers['x-device-id'] ||
       req.headers['x-device'] ||
       '';
@@ -293,7 +271,6 @@ app.post('/audio-ingest', express.raw({ type: '*/*', limit: '10mb' }), (req, res
       return res.status(400).json({ error: 'audio body required' });
     }
 
-    // DEBUG: log every ingest so you can confirm chunks are actually arriving
     console.debug(`[audio-ingest] received ${req.body.length} bytes for device="${deviceId}"`);
     debugAudioClients('audio-ingest');
 
@@ -302,7 +279,6 @@ app.post('/audio-ingest', express.raw({ type: '*/*', limit: '10mb' }), (req, res
 
     const sent = broadcastAudioChunk(deviceId, chunk);
 
-    // DEBUG: warn explicitly when nothing was delivered
     if (sent === 0) {
       console.warn(
         `[audio-ingest] ⚠️  0 listeners received audio for device="${deviceId}". ` +
@@ -326,7 +302,7 @@ app.post('/audio-stop', express.json(), (req, res) => {
   try {
     const deviceId =
       req.query.deviceId ||
-      req.query.device ||           // ← added: same fix as /audio-ingest above
+      req.query.device ||
       req.body?.deviceId ||
       req.headers['x-device-id'] ||
       req.headers['x-device'] ||
@@ -361,10 +337,6 @@ server.on('upgrade', (req, socket, head) => {
   const parsed = url.parse(req.url, true);
 
   if (parsed.pathname === '/audio-stream') {
-    // -----------------------------------------------------------------------
-    // FIX: accept both ?device= and ?deviceId= from the ESP side as well,
-    // mirroring the tolerance added to /audio-ingest above.
-    // -----------------------------------------------------------------------
     const deviceId = parsed.query.device || parsed.query.deviceId;
     if (!deviceId || typeof deviceId !== 'string') {
       console.warn('[audio-stream] WebSocket upgrade rejected — missing ?device= param. URL:', req.url);
@@ -379,8 +351,6 @@ server.on('upgrade', (req, socket, head) => {
       console.log(`[audio-stream] ✅ ESP connected for device="${deviceId}"`);
       debugAudioClients('after-connect');
 
-      // DEBUG: log any messages the ESP sends back so we can see if it's
-      // accidentally trying to push data rather than just receive it
       ws.on('message', (data, isBinary) => {
         if (isBinary) {
           console.debug(`[audio-stream] ← ESP sent binary ${data.length} bytes for device="${deviceId}" (unexpected — ESP should only receive)`);
@@ -426,10 +396,7 @@ server.on('upgrade', (req, socket, head) => {
 
                 console.log(`[ingest] hello from device ${deviceId}`);
 
-                await startSession(deviceId, {
-                  successSeconds: 5,
-                  timeoutSeconds: 180,
-                });
+                await startSession(deviceId);
               }
             } catch (_) {
               // ignore non-JSON text messages
@@ -446,10 +413,7 @@ server.on('upgrade', (req, socket, head) => {
           const frameBuffer = Buffer.from(data);
           streamStore.setLatestFrame(deviceId, frameBuffer);
 
-          await startSession(deviceId, {
-            successSeconds: 5,
-            timeoutSeconds: 180,
-          });
+          await startSession(deviceId);
         } catch (err) {
           console.error('[ingest] websocket message error:', err.message);
         }
